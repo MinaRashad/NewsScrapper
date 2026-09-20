@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+
+# Generated crawler output
+downloaded_images/
+validation_images/
