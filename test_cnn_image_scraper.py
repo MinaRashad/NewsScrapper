@@ -1,6 +1,7 @@
 import unittest
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import patch
 
 from bs4 import BeautifulSoup
 from PIL import Image
@@ -9,6 +10,7 @@ from cnn_image_scraper import (
     article_links,
     bfs_image_urls,
     canonical_url,
+    crawl_cnn_images,
     cnn_page_kind,
     existing_image_state,
     download_image_urls,
@@ -17,6 +19,7 @@ from cnn_image_scraper import (
     visual_image,
     visually_same,
 )
+from news_scraper.images import remove_images_without_minimum_faces
 
 
 class FakeImageResponse:
@@ -34,6 +37,25 @@ class FakeImageSession:
 
     def get(self, url: str, timeout: int):
         return FakeImageResponse(self.responses[url])
+
+
+class FakePageResponse:
+    def __init__(self, url: str, text: str):
+        self.url = url
+        self.text = text
+
+    def raise_for_status(self):
+        pass
+
+
+class FakePageSession:
+    def __init__(self, responses: dict[str, FakePageResponse]):
+        self.responses = responses
+        self.requested_urls: list[str] = []
+
+    def get(self, url: str, timeout: int):
+        self.requested_urls.append(url)
+        return self.responses[url]
 
 
 class CNNImageScraperTests(unittest.TestCase):
@@ -77,6 +99,7 @@ class CNNImageScraperTests(unittest.TestCase):
             FakeImageSession({"https://example.test/thumb.png": thumbnail, "https://example.test/full.png": full_size}),
             set(),
             [],
+            face_counter=lambda _: 2,
         )
         files = list(self.test_output_dir.iterdir())
         self.assertEqual(len(files), 1)
@@ -93,6 +116,7 @@ class CNNImageScraperTests(unittest.TestCase):
         download_image_urls(
             ["https://example.test/full.png"], self.test_output_dir,
             FakeImageSession({"https://example.test/full.png": full_size}), hashes, images,
+            face_counter=lambda _: 2,
         )
         files = list(self.test_output_dir.iterdir())
         self.assertEqual(len(files), 1)
@@ -104,6 +128,30 @@ class CNNImageScraperTests(unittest.TestCase):
         hashes, images = existing_image_state(Path("folder-that-does-not-exist"))
         self.assertEqual(hashes, set())
         self.assertEqual(images, [])
+
+    def test_image_with_fewer_than_two_faces_is_not_saved(self):
+        saved = download_image_urls(
+            ["https://example.test/one-face.png"], self.test_output_dir,
+            FakeImageSession({"https://example.test/one-face.png": self.png_bytes((100, 100))}), set(), [],
+            face_counter=lambda _: 1,
+        )
+        self.assertEqual(saved, [])
+        self.assertEqual(list(self.test_output_dir.iterdir()), [])
+
+    def test_cleanup_deletes_existing_image_with_fewer_than_two_faces(self):
+        rejected = self.test_output_dir / "one-face.png"
+        accepted = self.test_output_dir / "two-faces.png"
+        unrelated = self.test_output_dir / "notes.txt"
+        rejected.write_bytes(b"one")
+        accepted.write_bytes(b"two")
+        unrelated.write_text("leave me alone")
+        retained, removed = remove_images_without_minimum_faces(
+            [rejected, accepted], face_counter=lambda body: 1 if body == b"one" else 2
+        )
+        self.assertEqual((retained, removed), (1, 1))
+        self.assertFalse(rejected.exists())
+        self.assertTrue(accepted.exists())
+        self.assertTrue(unrelated.exists())
 
     def test_only_date_pattern_cnn_urls_are_articles(self):
         self.assertEqual(cnn_page_kind("https://edition.cnn.com/2026/09/18/world/story"), "article")
@@ -163,12 +211,28 @@ class CNNImageScraperTests(unittest.TestCase):
         )
         self.assertTrue(is_allowed_article(soup)[0])
 
-    def test_unrelated_section_and_headline_are_rejected(self):
+    def test_unrelated_section_and_headline_is_accepted_when_topic_filter_is_disabled(self):
         soup = BeautifulSoup(
             '<h1>How to sleep better tonight</h1><script type="application/ld+json">{"@type":"NewsArticle", "articleSection":"Health"}</script>',
             "html.parser",
         )
-        self.assertFalse(is_allowed_article(soup)[0])
+        self.assertTrue(is_allowed_article(soup)[0])
+
+    def test_min_images_continues_past_max_articles_until_target_is_met(self):
+        home = "https://edition.cnn.com"
+        first_article = "https://edition.cnn.com/2026/09/18/world/first"
+        second_article = "https://edition.cnn.com/2026/09/18/world/second"
+        session = FakePageSession({
+            home: FakePageResponse(home, f'<a href="{first_article}">First</a><a href="{second_article}">Second</a>'),
+            first_article: FakePageResponse(first_article, "<article></article>"),
+            second_article: FakePageResponse(second_article, "<article></article>"),
+        })
+        with patch("cnn_image_scraper._session", return_value=session), patch(
+            "cnn_image_scraper.download_image_urls", side_effect=[[Path("first.png")], [Path("second.png")]]
+        ):
+            saved = crawl_cnn_images(home, self.test_output_dir, max_articles=1, min_images=2)
+        self.assertEqual(saved, [Path("first.png"), Path("second.png")])
+        self.assertEqual(session.requested_urls, [home, first_article, second_article])
 
 
 if __name__ == "__main__":
