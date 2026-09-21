@@ -11,6 +11,7 @@ from cnn_image_scraper import (
     canonical_url,
     cnn_page_kind,
     existing_image_state,
+    download_image_urls,
     is_allowed_article,
     largest_srcset_candidate,
     visual_image,
@@ -18,7 +19,44 @@ from cnn_image_scraper import (
 )
 
 
+class FakeImageResponse:
+    def __init__(self, body: bytes):
+        self.content = body
+        self.headers = {"Content-Type": "image/png"}
+
+    def raise_for_status(self):
+        pass
+
+
+class FakeImageSession:
+    def __init__(self, responses: dict[str, bytes]):
+        self.responses = responses
+
+    def get(self, url: str, timeout: int):
+        return FakeImageResponse(self.responses[url])
+
+
 class CNNImageScraperTests(unittest.TestCase):
+    test_output_dir = Path(".test_image_replacement_output")
+
+    def setUp(self):
+        self.test_output_dir.mkdir(exist_ok=True)
+        for path in self.test_output_dir.iterdir():
+            if path.is_file():
+                path.unlink()
+
+    def tearDown(self):
+        for path in self.test_output_dir.iterdir():
+            if path.is_file():
+                path.unlink()
+        self.test_output_dir.rmdir()
+
+    @staticmethod
+    def png_bytes(size: tuple[int, int]) -> bytes:
+        image = BytesIO()
+        Image.new("RGB", size, (35, 110, 180)).save(image, "PNG")
+        return image.getvalue()
+
     def test_visual_comparison_matches_resized_variant(self):
         small = BytesIO()
         large = BytesIO()
@@ -29,6 +67,38 @@ class CNNImageScraperTests(unittest.TestCase):
         self.assertIsNotNone(small_image)
         self.assertIsNotNone(large_image)
         self.assertTrue(visually_same(small_image, large_image))
+
+    def test_larger_later_variant_replaces_thumbnail(self):
+        thumbnail = self.png_bytes((100, 50))
+        full_size = self.png_bytes((1000, 500))
+        saved = download_image_urls(
+            ["https://example.test/thumb.png", "https://example.test/full.png"],
+            self.test_output_dir,
+            FakeImageSession({"https://example.test/thumb.png": thumbnail, "https://example.test/full.png": full_size}),
+            set(),
+            [],
+        )
+        files = list(self.test_output_dir.iterdir())
+        self.assertEqual(len(files), 1)
+        with Image.open(files[0]) as image:
+            self.assertEqual(image.size, (1000, 500))
+        self.assertEqual(saved, files)
+
+    def test_larger_variant_replaces_existing_thumbnail(self):
+        thumbnail = self.png_bytes((100, 50))
+        full_size = self.png_bytes((1000, 500))
+        old_path = self.test_output_dir / "thumbnail.png"
+        old_path.write_bytes(thumbnail)
+        hashes, images = existing_image_state(self.test_output_dir)
+        download_image_urls(
+            ["https://example.test/full.png"], self.test_output_dir,
+            FakeImageSession({"https://example.test/full.png": full_size}), hashes, images,
+        )
+        files = list(self.test_output_dir.iterdir())
+        self.assertEqual(len(files), 1)
+        self.assertNotEqual(files[0], old_path)
+        with Image.open(files[0]) as image:
+            self.assertEqual(image.size, (1000, 500))
 
     def test_missing_output_folder_has_empty_existing_state(self):
         hashes, images = existing_image_state(Path("folder-that-does-not-exist"))

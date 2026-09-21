@@ -356,7 +356,12 @@ def existing_image_state(output_dir: Path) -> tuple[set[str], list[VisualImage]]
 def download_image_urls(
     image_urls: Iterable[str], output_dir: Path, session: requests.Session, content_hashes: set[str], visual_images: list[VisualImage]
 ) -> list[Path]:
-    """Save image URLs once globally, using their bytes as the final duplicate check."""
+    """Save image URLs once globally, retaining the largest visual variant.
+
+    Pages often expose a thumbnail before the matching full-size image (for
+    example, through JSON-LD).  A larger later download replaces every smaller
+    visually matching file, including files that were present before this run.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     saved: list[Path] = []
     for position, image_url in enumerate(image_urls, start=1):
@@ -373,19 +378,33 @@ def download_image_urls(
         digest = hashlib.sha256(body).hexdigest()
         if digest in content_hashes:
             continue
-        content_hashes.add(digest)
         destination = output_dir / f"{len(content_hashes):05d}-{digest[:12]}{extension_for(image_response, image_url)}"
         candidate = visual_image(destination, body)
-        equivalent = next((image for image in visual_images if candidate and visually_same(image, candidate)), None)
-        if equivalent is not None:
-            if candidate is not None and candidate.area > equivalent.area:
-                equivalent.path.unlink(missing_ok=True)
-                visual_images[visual_images.index(equivalent)] = candidate
-            else:
-                continue
-        destination.write_bytes(body)
+        equivalents = [image for image in visual_images if candidate and visually_same(image, candidate)]
+        # Never replace a matching image with an equal- or lower-resolution copy.
+        if equivalents and candidate is not None and candidate.area <= max(image.area for image in equivalents):
+            continue
+        try:
+            # Write first: a failed download/write must not destroy the existing
+            # thumbnail or full-size file it would otherwise replace.
+            destination.write_bytes(body)
+        except OSError as error:
+            print(f"Skipping {image_url}: could not save image ({error})")
+            continue
+        content_hashes.add(digest)
         saved.append(destination)
-        if candidate is not None and equivalent is None:
+        if candidate is not None:
+            for equivalent in equivalents:
+                try:
+                    old_digest = hashlib.sha256(equivalent.path.read_bytes()).hexdigest()
+                    equivalent.path.unlink()
+                except OSError as error:
+                    print(f"Could not remove lower-resolution duplicate {equivalent.path.name}: {error}")
+                    continue
+                content_hashes.discard(old_digest)
+                visual_images.remove(equivalent)
+                if equivalent.path in saved:
+                    saved.remove(equivalent.path)
             visual_images.append(candidate)
         print(f"Saved {destination.name}")
     return saved
