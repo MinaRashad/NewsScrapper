@@ -150,6 +150,7 @@ def download_cnn_article_images(start_url: str, output_dir: Path = Path("downloa
     """Fetch one accepted CNN article and download its distinct images."""
     if cnn_page_kind(start_url) != "article":
         raise ValueError("Expected a CNN article URL with a /YYYY/MM/DD/ date path.")
+    print(f"Starting article image download: {start_url}")
     session = _session()
     response = session.get(start_url, timeout=30)
     response.raise_for_status()
@@ -160,7 +161,9 @@ def download_cnn_article_images(start_url: str, output_dir: Path = Path("downloa
         return []
     print(f"Article accepted ({reason}).")
     if output_dir.is_dir():
-        remove_images_without_minimum_faces(path for path in output_dir.iterdir() if path.is_file())
+        existing_files = [path for path in output_dir.iterdir() if path.is_file()]
+        print(f"Checking {len(existing_files)} existing file(s) in {output_dir} for the face requirement.")
+        remove_images_without_minimum_faces(existing_files)
     hashes, visuals = existing_image_state(output_dir)
     return download_image_urls(image_urls_from_article(soup, response.url), output_dir, session, hashes, visuals)
 
@@ -176,12 +179,16 @@ def crawl_cnn_images(
         raise ValueError("max_articles must be at least 1.")
     if min_images is not None and min_images < 1:
         raise ValueError("min_images must be at least 1.")
+    target_description = f"{min_images} image(s)" if min_images is not None else f"up to {max_articles} article(s)"
+    print(f"Starting CNN crawl from {start_url}; target: {target_description}.")
     session = _session()
     queue: deque[str] = deque([canonical_url(start_url)])
     visited_pages: set[str] = set()
     visited_articles = 0
     if output_dir.is_dir():
-        remove_images_without_minimum_faces(path for path in output_dir.iterdir() if path.is_file())
+        existing_files = [path for path in output_dir.iterdir() if path.is_file()]
+        print(f"Checking {len(existing_files)} existing file(s) in {output_dir} for the face requirement.")
+        remove_images_without_minimum_faces(existing_files)
     hashes, visuals = existing_image_state(output_dir)
     saved: list[Path] = []
     # A requested image target takes precedence over the normal article cap. This
@@ -194,6 +201,7 @@ def crawl_cnn_images(
         if page_url in visited_pages:
             continue
         visited_pages.add(page_url)
+        print(f"Fetching page ({visited_articles} article(s) visited, {len(saved)} image(s) downloaded, {len(queue)} queued): {page_url}")
         try:
             response = session.get(page_url, timeout=30)
             response.raise_for_status()
@@ -205,9 +213,12 @@ def crawl_cnn_images(
             print(f"Skipping redirected off-site page: {resolved_url}")
             continue
         soup = BeautifulSoup(response.text, "html.parser")
-        for link in article_links(soup, resolved_url):
+        discovered_links = article_links(soup, resolved_url)
+        for link in discovered_links:
             if link not in visited_pages:
                 queue.append(link)
+        if discovered_links:
+            print(f"Discovered {len(discovered_links)} CNN article link(s); {len(queue)} page(s) now queued.")
         if cnn_page_kind(resolved_url) != "article":
             print(f"Skipping CNN section/navigation page: {resolved_url}")
             continue
@@ -218,6 +229,7 @@ def crawl_cnn_images(
             continue
         print(f"Article accepted ({reason}): {resolved_url}")
         saved.extend(download_image_urls(image_urls_from_article(soup, resolved_url), output_dir, session, hashes, visuals))
+        print(f"Progress: {visited_articles} article(s) visited; {len(saved)} unique image(s) retained.")
     print(f"Visited {visited_articles} article(s); downloaded {len(saved)} unique image(s).")
     return saved
 

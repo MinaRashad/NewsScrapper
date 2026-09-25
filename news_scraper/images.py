@@ -45,16 +45,21 @@ def remove_images_without_minimum_faces(
     for path in paths:
         if path.suffix.lower() not in IMAGE_EXTENSIONS:
             continue
+        print(f"Checking existing image for faces: {path.name}")
         try:
-            has_enough_faces = counter(path.read_bytes()) >= minimum_faces
+            detected_faces = counter(path.read_bytes())
+            has_enough_faces = detected_faces >= minimum_faces
         except (OSError, ValueError, cv2.error):
+            detected_faces = 0
             has_enough_faces = False
         if has_enough_faces:
             retained += 1
+            print(f"Keeping {path.name}: found {detected_faces} face(s).")
             continue
         try:
             path.unlink()
             removed += 1
+            print(f"Removed {path.name}: found {detected_faces} face(s); need at least {minimum_faces}.")
         except OSError as error:
             print(f"Could not remove face-filtered image {path.name}: {error}")
     return retained, removed
@@ -156,6 +161,7 @@ def download_image_urls(
     counter = face_counter or face_count
     saved: list[Path] = []
     for image_url in image_urls:
+        print(f"Fetching image candidate: {image_url}")
         try:
             image_response = session.get(image_url, timeout=30)
             image_response.raise_for_status()
@@ -168,6 +174,7 @@ def download_image_urls(
         body = image_response.content
         digest = hashlib.sha256(body).hexdigest()
         if digest in content_hashes:
+            print(f"Skipping {image_url}: identical image was already downloaded.")
             continue
         try:
             detected_faces = counter(body)
@@ -176,10 +183,12 @@ def download_image_urls(
         if detected_faces < minimum_faces:
             print(f"Skipping {image_url}: found {detected_faces} face(s); need at least {minimum_faces}.")
             continue
+        print(f"Face check passed for {image_url}: found {detected_faces} face(s).")
         destination = output_dir / f"{len(content_hashes):05d}-{digest[:12]}{extension_for(image_response, image_url)}"
         candidate = visual_image(destination, body)
         equivalents = [image for image in visual_images if candidate and visually_same(image, candidate)]
         if equivalents and candidate is not None and candidate.area <= max(image.area for image in equivalents):
+            print(f"Skipping {image_url}: an equal or higher-resolution visual duplicate already exists.")
             continue
         try:
             destination.write_bytes(body)
@@ -200,6 +209,7 @@ def download_image_urls(
                 visual_images.remove(equivalent)
                 if equivalent.path in saved:
                     saved.remove(equivalent.path)
+                print(f"Replaced lower-resolution duplicate: {equivalent.path.name}")
             visual_images.append(candidate)
         print(f"Saved {destination.name}")
     return saved
